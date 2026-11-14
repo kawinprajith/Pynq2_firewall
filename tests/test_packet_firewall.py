@@ -58,9 +58,12 @@ def make_w4(dip_hi, dip_lo, src_port, dst_port):
 # AXI4-Lite helpers
 # ---------------------------------------------------------------------------
 
+
 async def axil_write(dut, addr, data):
-    """Single AXI4-Lite write transaction."""
+    """AXI4-Lite write with proper response handshake and timeout."""
+
     await FallingEdge(dut.aclk)
+
     dut.s_axil_awaddr.value  = addr
     dut.s_axil_awvalid.value = 1
     dut.s_axil_wdata.value   = data
@@ -68,54 +71,81 @@ async def axil_write(dut, addr, data):
     dut.s_axil_wvalid.value  = 1
     dut.s_axil_bready.value  = 1
 
-    # Wait for both write-address and write-data to be accepted
     aw_done = False
-    w_done  = False
-    while not (aw_done and w_done):
+    w_done = False
+
+    # Wait for both address and data handshakes
+    for _ in range(30):
         await RisingEdge(dut.aclk)
-        if int(dut.s_axil_awready.value) == 1:
+
+        if int(dut.s_axil_awready.value):
             aw_done = True
-        if int(dut.s_axil_wready.value) == 1:
+
+        if int(dut.s_axil_wready.value):
             w_done = True
+
+        if aw_done and w_done:
+            break
+    else:
+        raise AssertionError(
+            f"AXI write timeout: AWREADY={int(dut.s_axil_awready.value)}, "
+            f"WREADY={int(dut.s_axil_wready.value)}"
+        )
 
     await FallingEdge(dut.aclk)
     dut.s_axil_awvalid.value = 0
     dut.s_axil_wvalid.value  = 0
 
-    # Wait for write response
-    while True:
+    # Wait for BVALID and keep BREADY high through a rising edge.
+    for _ in range(30):
         await RisingEdge(dut.aclk)
-        if int(dut.s_axil_bvalid.value) == 1:
+
+        if int(dut.s_axil_bvalid.value):
             break
+    else:
+        raise AssertionError("AXI write response timeout: BVALID not asserted")
+
+    # The response handshake occurs on the rising edge above.
     await FallingEdge(dut.aclk)
     dut.s_axil_bready.value = 0
 
 
 async def axil_read(dut, addr):
-    """Single AXI4-Lite read transaction; returns integer value."""
+    """AXI4-Lite read with proper response handshake and timeout."""
+
     await FallingEdge(dut.aclk)
+
     dut.s_axil_araddr.value  = addr
     dut.s_axil_arvalid.value = 1
     dut.s_axil_rready.value  = 1
 
-    while True:
+    # Address handshake
+    for _ in range(30):
         await RisingEdge(dut.aclk)
-        if int(dut.s_axil_arready.value) == 1:
+
+        if int(dut.s_axil_arready.value):
             break
+    else:
+        raise AssertionError("AXI read timeout: ARREADY not asserted")
 
     await FallingEdge(dut.aclk)
     dut.s_axil_arvalid.value = 0
 
-    while True:
+    # Read response handshake
+    for _ in range(30):
         await RisingEdge(dut.aclk)
-        if int(dut.s_axil_rvalid.value) == 1:
+
+        if int(dut.s_axil_rvalid.value):
             value = int(dut.s_axil_rdata.value)
             break
+    else:
+        raise AssertionError("AXI read timeout: RVALID not asserted")
 
+    # RVALID and RREADY handshake occurred at the rising edge above.
     await FallingEdge(dut.aclk)
     dut.s_axil_rready.value = 0
-    return value
 
+    return value
 
 # ---------------------------------------------------------------------------
 # Reset
@@ -288,10 +318,13 @@ async def packet_firewall_test(dut):
     # TEST 3: TCP SYN port 80 → ALLOW (7 words)
     # -------------------------------------------------------------------------
     dut._log.info("=== TEST 3 : TCP SYN port 80 → ALLOW ===")
+    pkts_before_t3 = stats["out_pkts"]
     await send_tcp_syn_80(dut)
     await wait_cycles(dut, 15)
     log_counters(dut, stats, "T3", include_syn=True)
-    assert stats["out_pkts"] == 3, "T3: expected 3 output packets total"
+    assert stats["out_pkts"] == pkts_before_t3 + 1, \
+        "T3: expected exactly 1 new output packet, got %d new" % (stats["out_pkts"] - pkts_before_t3)
+
 
     # -------------------------------------------------------------------------
     # TEST 4: TCP Telnet port 23 → DROP
@@ -339,6 +372,9 @@ async def packet_firewall_test(dut):
     await wait_cycles(dut, 12)
     dut._log.info("After SYN#4: syn_flood=%d", int(dut.syn_flood_detected.value))
     log_counters(dut, stats, "T5")
+    assert stats["out_words"] == words_before, \
+        "T5: SYN#4 should be dropped — output word count must not increase"
+
 
     # -------------------------------------------------------------------------
     # TEST 6: REAL backpressure — hold m_axis_tready=0 mid-flush
@@ -401,20 +437,24 @@ async def packet_firewall_test(dut):
     # -------------------------------------------------------------------------
     # TEST 8: Disable firewall via CONTROL[0]=0 → traffic passes without filter
     # -------------------------------------------------------------------------
-    dut._log.info("=== TEST 8 : Disable firewall → pass-all ===")
+    dut._log.info("=== TEST 8 : Disable firewall -> pass-all ===")
     await axil_write(dut, 0x00, 0x0)   # CONTROL EN=0
     ctrl = await axil_read(dut, 0x00)
-    assert ctrl & 0x1 == 0, "CONTROL[0] should be 0 (disabled)"
+    assert (ctrl & 0x1) == 0, "CONTROL[0] should be 0 (disabled)"
 
-    pkts_before = stats["out_pkts"]
-    # Telnet — normally DROPPED — should now pass through
+    pkts_before_t8 = stats["out_pkts"]
+    # Telnet — normally DROPPED — must now pass through when fw disabled
     await send_tcp_telnet(dut)
     await wait_cycles(dut, 20)
-    # Note: in disabled mode packet_count is NOT incremented (bypass path)
-    dut._log.info("After disabled-FW Telnet: out_pkts=%d (should be +1)", stats["out_pkts"])
+    pkts_after_t8 = stats["out_pkts"]
+    assert pkts_after_t8 == pkts_before_t8 + 1, \
+        "T8: disabled firewall must pass Telnet: expected %d pkts, got %d" % (
+            pkts_before_t8 + 1, pkts_after_t8)
+    dut._log.info("T8 passed: Telnet allowed when firewall disabled")
 
     # Re-enable for safety
     await axil_write(dut, 0x00, 0x1)
+
 
     # -------------------------------------------------------------------------
     # Summary
